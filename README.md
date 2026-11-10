@@ -71,3 +71,44 @@
 </details></center>
 
 
+
+---
+
+# 边缘自生成版改造（2026-11-10）
+
+原版 `_worker.js` 只是把请求转发给 `https://speed.cloudflare.com/__down?bytes=...`，
+本质仍是公共测速端点的一个壳，会跟全社区共用同一份限流配额：
+
+- 大包请求（≥100MB）被 `speed.cloudflare.com` 返回 `429 Too Many Requests`
+- 此时所有候选 IP 同时测不出速度，看起来像"整条线路挂了 / 节点全部 -1"
+
+本次改造把数据源换成 **边缘现场生成**，不再发出任何上游请求：
+
+| 项 | 原版 | 现版 |
+|---|---|---|
+| 数据来源 | `fetch(speed.cloudflare.com/__down)` | `ReadableStream` 现场生成随机字节 |
+| 响应头 | 透传上游，无 `Content-Length` | 自带 `Content-Length`，可直接算吞吐 |
+| 上限 | 受上游限额 | 1G（默认 200MB） |
+| 探针 | 无 | `/1` 返回 1 字节，用于验证边缘 IP 能否服务本 Worker 路由 |
+| 标记 | 无 | `x-cf-speed: edge-gen` |
+
+同时保留原有路径语义：`/`（200MB）、`/1024k`、`/50m`、`/200m`、`/1g`、`/locations`，并支持 `HEAD`。
+
+## 部署后自检
+
+```bash
+# 应看到 x-cf-speed: edge-gen，且不再出现 _cfuvid / cf-meta-* 头
+curl -sI https://<你的域名>/1m | grep -iE 'content-length|x-cf-speed|x-cfuvid|cf-meta'
+
+# 1 字节探针
+curl -s -o /dev/null -w '%{http_code} %{size_download}\n' https://<你的域名>/1
+
+# 大包不再 429
+curl -s -o /dev/null -w '%{http_code} %{size_download} %{speed_download}\n' --max-time 15 https://<你的域名>/200m
+```
+
+## 关于优选的一个实测结论
+
+`162.159.0.0/15` 与 `108.162.192.0/18` 这两段：普通代理站点正常，但 **Worker 自定义域一律返回 403（error 1003）**。
+用 `speed.cloudflare.com` 做测速源时这些 IP 往往速度最快，拿去接 Worker 节点却必然 `-1`。
+用本域名的 `/1` 做一次 1 字节探针即可提前剔除这类 IP。
