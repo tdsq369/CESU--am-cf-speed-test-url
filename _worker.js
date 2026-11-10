@@ -1,33 +1,99 @@
 /**
- * CESU — am-cf-speed-test-url（边缘自生成版 / edge-generated rewrite）
+ * CESU — am-cf-speed-test-url / v2
  *
- * 与 speed.cloudflare.com 彻底解耦：测速数据在 Cloudflare 边缘现场生成，
- * 零回源、零共享配额，不会被公共测速端点的 429 限流波及。
+ * 定位：Cloudflare 优选用的「探针 + 测速源」。两类请求分开处理：
+ *   - /1、/probe            → 本地生成 1 字节（极便宜，用来验证该边缘 IP 能否服务本 Worker 路由）
+ *   - /{n}{k|m|g}、/        → 默认上游直通（pass-through，快），上游 429/失败时自动降级为本地生成
  *
- * 路径：
- *   /             → 200MB（默认）
- *   /1            → 1 字节（优选探针：验证该边缘 IP 能否服务本 Worker 路由）
- *   /1024k /50m /80m /200m /1g
- *   /locations    → 透传 CF 官方机房列表（小请求，保留兼容）
+ * 为什么这样做（2026-11-10 实测，同一边缘 IP 172.64.144.10）：
+ *   CF 原生 speed.cloudflare.com : 29.4 – 77 MB/s
+ *   本 Worker 边缘生成(256KB)     : 3.0 – 5.0 MB/s
+ *   本 Worker 边缘生成(4MB)       : 3.7 – 8.5 MB/s
+ *   本 Worker FixedLengthStream   : 3.5 – 7.6 MB/s
+ *   → 自己生成字节要过 isolate 的 JS，被 CPU 预算卡住；原样透传则由 runtime 托管搬运，能跑满。
+ *   所以：默认透传，失败才降级生成，并用 x-cf-speed-src 标明数据来源。
  *
- * 特性：
- *   - 自带 Content-Length，客户端可直接按字节/时间算真实吞吐
- *   - 支持 HEAD
- *   - 缓冲区复用，CPU 开销接近 0
- *   - 响应带 x-cf-speed: edge-gen，便于确认是否已切到本地生成
+ * 参数：
+ *   ?mode=upstream|gen   强制数据来源（对照测试用）
+ *   ?debug=1             允许 ck=<分片字节> / nc=1(不带 Content-Length)
+ *
+ * 响应头：
+ *   x-cf-speed-src: upstream | gen | gen-fallback
+ *   x-cf-speed: edge-gen-v2
  */
 
 const UNIT = { k: 1000, m: 1000000, g: 1000000000 };
 const DEFAULT_BYTES = 200000000;
 const MAX_BYTES = 1073741824; // 1G
-const CHUNK = 4194304; // 4MB：分片太小会被 RTT 限速（256KB≈3-5MB/s，4MB≈25MB/s+）
+const GEN_CHUNK = 4194304; // 4MB
+
+function parseSize(path) {
+  if (!path) return DEFAULT_BYTES;
+  const m = path.match(/^(\d+)([kmg])?$/i);
+  if (!m) return 0;
+  const n = parseInt(m[1], 10);
+  const bytes = m[2] ? n * (UNIT[m[2].toLowerCase()] || 1) : n;
+  if (!Number.isFinite(bytes) || bytes <= 0) return 0;
+  return Math.min(bytes, MAX_BYTES);
+}
+
+function baseHeaders(bytes, src, withLength) {
+  const h = {
+    "content-type": "application/octet-stream",
+    "cache-control": "no-store, no-transform",
+    "access-control-allow-origin": "*",
+    "timing-allow-origin": "*",
+    "x-cf-speed-src": src,
+    "x-cf-speed": "edge-gen-v2",
+  };
+  if (withLength) h["content-length"] = String(bytes);
+  return h;
+}
+
+function generate(bytes, chunk, withLength) {
+  const buf = new Uint8Array(chunk);
+  crypto.getRandomValues(buf.subarray(0, Math.min(chunk, 65536)));
+  let sent = 0;
+  const body = new ReadableStream(
+    {
+      pull(controller) {
+        if (sent >= bytes) {
+          controller.close();
+          return;
+        }
+        const n = Math.min(chunk, bytes - sent);
+        controller.enqueue(n === chunk ? buf : buf.slice(0, n));
+        sent += n;
+      },
+    },
+    { highWaterMark: 3 }
+  );
+  return new Response(body, { status: 200, headers: baseHeaders(bytes, "gen", withLength) });
+}
 
 export default {
   async fetch(request) {
     const url = new URL(request.url);
-    const path = url.pathname.slice(1);
+    const path = url.pathname.replace(/^\/+/, "");
+    const q = url.searchParams;
 
-    // 机房列表：保留官方数据，失败也不影响测速
+    if (path === "health") {
+      return new Response(
+        JSON.stringify({
+          app: "cesu-speedtest",
+          version: 2,
+          mode_default: "upstream",
+          upstream: "https://speed.cloudflare.com/__down",
+          fallback: "edge-gen",
+          max_bytes: MAX_BYTES,
+          gen_chunk: GEN_CHUNK,
+          routes: ["/", "/probe", "/1", "/{n}{k|m|g}", "/health", "/locations"],
+          note: "生成字节受 Worker CPU 预算限制（约 3-8MB/s）；透传可跑满，但可能遇到上游 429",
+        }),
+        { status: 200, headers: { "content-type": "application/json", "access-control-allow-origin": "*" } }
+      );
+    }
+
     if (path === "locations") {
       try {
         const r = await fetch("https://speed.cloudflare.com/locations", {
@@ -42,89 +108,71 @@ export default {
           },
         });
       } catch (e) {
-        return new Response("[]", {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
+        return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
       }
     }
 
-    // 解析尺寸：/1 = 1 字节，/1024k /50m /200m /1g
-    let bytes = DEFAULT_BYTES;
-    if (path) {
-      const m = path.match(/^(\d+)([kmg])?$/i);
-      if (!m) {
-        return new Response("路径格式不正确，示例：/1 /1024k /50m /200m /1g", {
-          status: 400,
-        });
+    // 探针：固定 1 字节，绝不打上游
+    if (path === "probe") {
+      if (request.method === "HEAD") {
+        return new Response(null, { status: 200, headers: baseHeaders(1, "gen", true) });
       }
-      const n = parseInt(m[1], 10);
-      bytes = m[2] ? n * (UNIT[m[2].toLowerCase()] || 1) : n;
+      return generate(1, 65536, true);
     }
-    if (!Number.isFinite(bytes) || bytes <= 0) bytes = DEFAULT_BYTES;
-    if (bytes > MAX_BYTES) bytes = MAX_BYTES;
 
-    // 诊断开关：?nc=1 不带 Content-Length；?ck=8388608 指定分片大小
-    const q = url.searchParams;
-    const noCL = q.get("nc") === "1";
-    const chunk = Math.min(Math.max(parseInt(q.get("ck") || String(CHUNK), 10) || CHUNK, 65536), 8388608);
+    const bytes = parseSize(path);
+    if (!bytes) {
+      return new Response("路径格式不正确，示例：/probe /1 /1024k /50m /200m /1g", { status: 400 });
+    }
 
-    const headers = {
-      "content-type": "application/octet-stream",
-      "cache-control": "no-store, no-transform",
-      "access-control-allow-origin": "*",
-      "timing-allow-origin": "*",
-      "x-cf-speed": "edge-gen",
-    };
-
-    if (!noCL) headers["content-length"] = String(bytes);
+    const debug = q.get("debug") === "1";
+    const chunk = debug
+      ? Math.min(Math.max(parseInt(q.get("ck") || String(GEN_CHUNK), 10) || GEN_CHUNK, 65536), 8388608)
+      : GEN_CHUNK;
+    const withLength = !(debug && q.get("nc") === "1");
+    const mode = q.get("mode") || (bytes <= 1048576 ? "gen" : "upstream");
 
     if (request.method === "HEAD") {
-      return new Response(null, { status: 200, headers });
+      return new Response(null, {
+        status: 200,
+        headers: baseHeaders(bytes, mode === "gen" ? "gen" : "upstream", withLength),
+      });
     }
 
-    // v2：FixedLengthStream + 写入器泵送（CF 推荐写法，runtime 自动置 Content-Length）
-    if (q.get("v") === "2") {
-      const { readable, writable } = new FixedLengthStream(bytes);
-      const buf2 = new Uint8Array(chunk);
-      (async () => {
-        const w = writable.getWriter();
-        let sent2 = 0;
-        try {
-          while (sent2 < bytes) {
-            const n = Math.min(chunk, bytes - sent2);
-            await w.write(n === chunk ? buf2 : buf2.subarray(0, n));
-            sent2 += n;
-          }
-          await w.close();
-        } catch (e) {
-          try { await w.abort(e); } catch (_) {}
+    if (mode === "upstream") {
+      try {
+        const up = await fetch(`https://speed.cloudflare.com/__down?bytes=${bytes}`, {
+          headers: { accept: "*/*" },
+        });
+        if (up.status === 200) {
+          const h = new Headers(up.headers);
+          h.set("cache-control", "no-store, no-transform");
+          h.set("access-control-allow-origin", "*");
+          h.set("timing-allow-origin", "*");
+          h.set("x-cf-speed-src", "upstream");
+          h.set("x-cf-speed", "edge-gen-v2");
+          return new Response(up.body, { status: 200, headers: h });
         }
-      })();
-      const h2 = { ...headers };
-      delete h2["content-length"];
-      return new Response(readable, { status: 200, headers: h2 });
+        // 429/403/其他 → 降级本地生成，并标注来源
+        if (up.body) {
+          try {
+            await up.body.cancel();
+          } catch (e) {}
+        }
+        const r = generate(bytes, chunk, withLength);
+        const fh = new Headers(r.headers);
+        fh.set("x-cf-speed-src", "gen-fallback");
+        fh.set("x-cf-speed-upstream-status", String(up.status));
+        return new Response(r.body, { status: 200, headers: fh });
+      } catch (e) {
+        const r = generate(bytes, chunk, withLength);
+        const fh = new Headers(r.headers);
+        fh.set("x-cf-speed-src", "gen-fallback");
+        fh.set("x-cf-speed-upstream-status", "error");
+        return new Response(r.body, { status: 200, headers: fh });
+      }
     }
 
-    // 边缘生成随机字节流（复用同一缓冲区，避免逐块分配）
-    const buf = new Uint8Array(chunk);
-    crypto.getRandomValues(buf.subarray(0, 65536));
-    let sent = 0;
-    const body = new ReadableStream(
-      {
-        pull(controller) {
-          if (sent >= bytes) {
-            controller.close();
-            return;
-          }
-          const n = Math.min(chunk, bytes - sent);
-          controller.enqueue(n === chunk ? buf : buf.slice(0, n));
-          sent += n;
-        },
-      },
-      { highWaterMark: 3 }
-    );
-
-    return new Response(body, { status: 200, headers });
+    return generate(bytes, chunk, withLength);
   },
 };

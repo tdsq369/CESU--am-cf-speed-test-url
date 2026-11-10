@@ -112,3 +112,62 @@ curl -s -o /dev/null -w '%{http_code} %{size_download} %{speed_download}\n' --ma
 `162.159.0.0/15` 与 `108.162.192.0/18` 这两段：普通代理站点正常，但 **Worker 自定义域一律返回 403（error 1003）**。
 用 `speed.cloudflare.com` 做测速源时这些 IP 往往速度最快，拿去接 Worker 节点却必然 `-1`。
 用本域名的 `/1` 做一次 1 字节探针即可提前剔除这类 IP。
+
+
+---
+
+# v2：探针 + 测速源分离（2026-11-10）
+
+## 为什么改
+
+同一边缘 IP（`172.64.144.10`）实测：
+
+| 数据来源 | 速度 |
+|---|---|
+| CF 原生 `speed.cloudflare.com` | 29.4 – 77 MB/s |
+| 本 Worker 边缘生成（256KB 分片） | 3.0 – 5.0 MB/s |
+| 本 Worker 边缘生成（4MB 分片） | 3.7 – 8.5 MB/s |
+| 本 Worker `FixedLengthStream` | 3.5 – 7.6 MB/s |
+
+**自己生成的字节要经过 isolate 的 JS，被 CPU 预算卡住**（Free 计划 10ms/请求），调分片、去掉 Content-Length 都没用；
+**原样透传上游时 bytes 由 runtime 托管搬运**，才能跑满。所以 v2 的策略是：
+
+> 默认透传上游，上游失败/限流时自动降级本地生成，并用响应头标明数据来源。
+
+## 路由
+
+| 路径 | 行为 | 用途 |
+|---|---|---|
+| `/probe`、`/1` | 本地生成 1 字节，**绝不打上游** | 优选探针：验证该边缘 IP 能否服务本 Worker 路由 |
+| `/`、`/{n}{k\|m\|g}` | 默认透传 `speed.cloudflare.com/__down`；429/异常时降级本地生成 | 带宽实测 |
+| `/health` | JSON：版本、默认模式、上游地址、上限、路由表 | 端点自描述，方便工具端自动识别 |
+| `/locations` | 透传官方机房表 | 兼容原有工具 |
+
+## 响应头
+
+| 头 | 含义 |
+|---|---|
+| `x-cf-speed-src` | `upstream` / `gen` / `gen-fallback`，标明这批字节从哪来 |
+| `x-cf-speed-upstream-status` | 降级时记录上游状态码（如 `429`） |
+| `x-cf-speed` | `edge-gen-v2` |
+
+## 参数
+
+- `?mode=upstream|gen` 强制数据来源（对照测试）
+- `?debug=1` 之后才认 `ck=<分片字节>` 与 `nc=1`（不带 Content-Length）
+
+## 自检
+
+```bash
+curl -s https://<域名>/health | jq .
+curl -s -o /dev/null -w '%{http_code} %{size_download}\n' https://<域名>/probe
+curl -sI https://<域名>/50m | grep -i x-cf-speed-src     # 期望 upstream
+curl -s -o /dev/null -w '%{speed_download}\n' https://<域名>/50m
+curl -s -o /dev/null -w '%{speed_download}\n' 'https://<域名>/50m?mode=gen'   # 对照：应明显更慢
+```
+
+## 重要提醒
+
+- 透传模式**可能继承 `speed.cloudflare.com` 的 429 配额**。真要做稳定的长期测速源，请用 **R2 公共桶 + 自定义域**（走 CF 原生数据面，不经 isolate、不共享公共配额）。
+- 本 Worker 的 `/probe` 在任何情况下都不打上游，所以**预算再紧也能用它做可用性判定**。
+- `162.159.0.0/15`、`108.162.192.0/18` 对普通代理站点正常，但对 Worker 自定义域返回 403 —— 优选时务必先用 `/probe` 过滤。
