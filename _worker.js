@@ -20,7 +20,7 @@
 const UNIT = { k: 1000, m: 1000000, g: 1000000000 };
 const DEFAULT_BYTES = 200000000;
 const MAX_BYTES = 1073741824; // 1G
-const CHUNK = 262144; // 256KB
+const CHUNK = 4194304; // 4MB：分片太小会被 RTT 限速（256KB≈3-5MB/s，4MB≈25MB/s+）
 
 export default {
   async fetch(request) {
@@ -93,7 +93,7 @@ export default {
           sent += n;
         },
       },
-      { highWaterMark: 4 }
+      { highWaterMark: 3 }
     );
 
     return new Response(body, { status: 200, headers });
