@@ -83,6 +83,29 @@ export default {
       return new Response(null, { status: 200, headers });
     }
 
+    // v2：FixedLengthStream + 写入器泵送（CF 推荐写法，runtime 自动置 Content-Length）
+    if (q.get("v") === "2") {
+      const { readable, writable } = new FixedLengthStream(bytes);
+      const buf2 = new Uint8Array(chunk);
+      (async () => {
+        const w = writable.getWriter();
+        let sent2 = 0;
+        try {
+          while (sent2 < bytes) {
+            const n = Math.min(chunk, bytes - sent2);
+            await w.write(n === chunk ? buf2 : buf2.subarray(0, n));
+            sent2 += n;
+          }
+          await w.close();
+        } catch (e) {
+          try { await w.abort(e); } catch (_) {}
+        }
+      })();
+      const h2 = { ...headers };
+      delete h2["content-length"];
+      return new Response(readable, { status: 200, headers: h2 });
+    }
+
     // 边缘生成随机字节流（复用同一缓冲区，避免逐块分配）
     const buf = new Uint8Array(chunk);
     crypto.getRandomValues(buf.subarray(0, 65536));
