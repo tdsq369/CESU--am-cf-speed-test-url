@@ -77,6 +77,25 @@ export default {
     const path = url.pathname.replace(/^\/+/, "");
     const q = url.searchParams;
 
+    // P1：反代 R2 自定义域 —— 让客户端落本 zone 的边缘（实测 NRT/SIN），
+    // 而不是直接吃 R2 自定义域被路由到 AMS 的跨洋路径。
+    if (path.startsWith("r2/")) {
+      const key = path.slice(3);
+      if (!key) return new Response("missing key", { status: 400 });
+      try {
+        const up = await fetch("https://speed.369529.xyz/" + key, {
+          cf: { cacheEverything: true, cacheTtl: 3600 },
+        });
+        const h = new Headers(up.headers);
+        h.set("cache-control", "public, max-age=31536000, immutable");
+        h.set("access-control-allow-origin", "*");
+        h.set("x-cf-speed-src", "r2");
+        return new Response(up.body, { status: up.status, headers: h });
+      } catch (e) {
+        return new Response("r2 fetch failed", { status: 502 });
+      }
+    }
+
     if (path === "health") {
       return new Response(
         JSON.stringify({
