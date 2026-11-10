@@ -64,21 +64,27 @@ export default {
     if (!Number.isFinite(bytes) || bytes <= 0) bytes = DEFAULT_BYTES;
     if (bytes > MAX_BYTES) bytes = MAX_BYTES;
 
+    // 诊断开关：?nc=1 不带 Content-Length；?ck=8388608 指定分片大小
+    const q = url.searchParams;
+    const noCL = q.get("nc") === "1";
+    const chunk = Math.min(Math.max(parseInt(q.get("ck") || String(CHUNK), 10) || CHUNK, 65536), 8388608);
+
     const headers = {
       "content-type": "application/octet-stream",
-      "content-length": String(bytes),
       "cache-control": "no-store, no-transform",
       "access-control-allow-origin": "*",
       "timing-allow-origin": "*",
       "x-cf-speed": "edge-gen",
     };
 
+    if (!noCL) headers["content-length"] = String(bytes);
+
     if (request.method === "HEAD") {
       return new Response(null, { status: 200, headers });
     }
 
     // 边缘生成随机字节流（复用同一缓冲区，避免逐块分配）
-    const buf = new Uint8Array(CHUNK);
+    const buf = new Uint8Array(chunk);
     crypto.getRandomValues(buf.subarray(0, 65536));
     let sent = 0;
     const body = new ReadableStream(
@@ -88,8 +94,8 @@ export default {
             controller.close();
             return;
           }
-          const n = Math.min(CHUNK, bytes - sent);
-          controller.enqueue(n === CHUNK ? buf : buf.slice(0, n));
+          const n = Math.min(chunk, bytes - sent);
+          controller.enqueue(n === chunk ? buf : buf.slice(0, n));
           sent += n;
         },
       },
